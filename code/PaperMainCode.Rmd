@@ -1,0 +1,294 @@
+---
+title: "PaperCode"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load required packages and sources
+
+```{r library}
+library(ggplot2)
+library(randomForest)
+library(caret)
+library(Rtsne)
+library(dplyr)
+source("grid_arrange_share_legend.R")
+source("kFoldCV_BaseLearner.R")
+source("kFoldCV_GoldStandard.R")
+source("theme_self.R")
+```
+
+## Prepare data for analyzing
+
+```{r prepare_data}
+labels <- core[, c("RPT", "LKADT_P", "DEATH", "DISCONT", "ENDTRS_C", "ENTRT_PC")]
+labels$DISCONT <- as.integer(labels$DISCONT)
+labels$ENTRT_PC <- as.integer(labels$ENTRT_PC)
+labels <- na.omit(labels)
+
+# construct new labels
+labels$new_Death <- ifelse(labels$DEATH == 'YES', 1, 0)
+labels$new_Discont <- ifelse(grepl("AE", labels$ENDTRS_C) & labels$ENTRT_PC <= 93, 1, 0)
+labels$new_label <- ifelse(labels$new_Death == 0 & labels$new_Discont == 0 & labels$DISCONT == 0, 0, 1)
+
+coreData <- cbind(labels[, c("RPT", "new_label")], 
+                  DEATH = death[death$RPT %in% labels$RPT, "DEATH"],
+                  DEATH_day = core[core$RPT %in% labels$RPT, "LKADT_P"],
+                  DISCONT = core[core$RPT %in% labels$RPT, "DISCONT"],
+                  DISCONT_day = core[core$RPT %in% labels$RPT, "ENTRT_PC"],
+                  core_habini[core_habini$RPT %in% labels$RPT, -1],
+                  core_exclude[core_exclude$RPT %in% labels$RPT, -1])
+coreData_Normal <- coreData
+coreData_Normal[, c(7:84)] <- lapply(coreData_Normal[, c(7:84)], function(x) (x-min(x))/(max(x)-min(x)))
+
+ASC <- coreData[grepl("^ASC", coreData$RPT), ]
+CEL <- coreData[grepl("^CEL", coreData$RPT), ]
+VEN <- coreData[grepl("^VEN", coreData$RPT), ]
+
+ASC_Normal <- coreData_Normal[grepl("^ASC", coreData_Normal$RPT), ]
+CEL_Normal <- coreData_Normal[grepl("^CEL", coreData_Normal$RPT), ]
+VEN_Normal <- coreData_Normal[grepl("^VEN", coreData_Normal$RPT), ]
+```
+
+## Summary data: table 1
+
+```{r Table1}
+core <- read.csv("data/CoreTable_training.csv", header = T, stringsAsFactors = F)
+coreSummary <- core[, c("STUDYID", "LKADT_P", "DEATH", "DISCONT", "ENDTRS_C", "ENTRT_PC", "AGEGRP")]
+coreSummary$DEATH <- ifelse(coreSummary$DEATH == 'YES', 1, 0)
+coreSummary$DISCONT <- as.numeric(coreSummary$DISCONT)
+coreSummary$ENTRT_PC <- as.numeric(coreSummary$ENTRT_PC)
+coreSummary$AGEGRP <- as.numeric(coreSummary$AGEGRP)
+coreSummary$AGEGRP[is.na(coreSummary$AGEGRP)] <- 85
+summaryCore <- tibble::as.tibble(coreSummary) %>%
+  group_by(STUDYID) %>%
+  summarise(Sample = n(), 
+            medianAge = median(AGEGRP),
+            perDiscont = sum(DISCONT, na.rm = T) / n(),
+            medianDiscont = median(ENTRT_PC, na.rm = T),
+            perDiscontMissing = sum(is.na(ENTRT_PC)) / n(),
+            perDeath = sum(DEATH) / n(),
+            medianDeath = median(LKADT_P),
+            perAE = sum(ENDTRS_C == 'AE') / n(),
+            perPossibleAE = sum(ENDTRS_C == 'possible_AE') / n(),
+            perProgression = sum(ENDTRS_C == 'progression') / n(),
+            perComplete = sum(ENDTRS_C == 'complete') / n(),
+            perTrtMissing = sum(ENDTRS_C == 'misce') / n())
+```
+
+## Base learner selection: figure 2
+
+```{r figure2}
+# will take a long time ...
+TotalinCohortCV_Normal <- data.frame()
+ASCinCohortCV_Normal <- data.frame()
+CELinCohortCV_Normal <- data.frame()
+VENinCohortCV_Normal <- data.frame()
+for (i in 1:10) {
+  TotalinCohortCV_Normal <- rbind(TotalinCohortCV_Normal, kFoldCV_BaseLearner(coreData_Normal, 5, i))
+  ASCinCohortCV_Normal <- rbind(ASCinCohortCV_Normal, kFoldCV_BaseLearner(ASC_Normal, 5, i))
+  CELinCohortCV_Normal <- rbind(CELinCohortCV_Normal, kFoldCV_BaseLearner(CEL_Normal, 5, i))
+  VENinCohortCV_Normal <- rbind(VENinCohortCV_Normal, kFoldCV_BaseLearner(VEN_Normal, 5, i))
+}
+TotalinCohortCV_Normal$Cohort <- 'ALL'
+ASCinCohortCV_Normal$Cohort <- "ASC"
+CELinCohortCV_Normal$Cohort <- "CEL"
+VENinCohortCV_Normal$Cohort <- "VEN"
+TinCohortCV_Normal <- rbind(TotalinCohortCV_Normal, ASCinCohortCV_Normal, CELinCohortCV_Normal, VENinCohortCV_Normal)
+TinCohortCV_Normal$model <- reorder(TinCohortCV_Normal$model, TinCohortCV_Normal$value)
+
+# A, B
+p_AUC <- ggplot(subset(TinCohortCV_Normal, curve == "AUC" & Cohort == "ALL"))
+p_AUC <- p_AUC + geom_violin(aes(model, value, fill = model), alpha = 0.8, width = 0.5, draw_quantiles = 0.5) + theme_bw() + 
+  theme_self() + scale_fill_manual(name = "Models", values = color) + #, labels = c("Baseline   ", "Linear Regression   ", "Logistic Regression   ", "Cox   ", "BAG-CART   ", "Random Forest   ")) + 
+  labs(x = "Models", y = "Area Under ROC Curve") + scale_y_continuous(limits = c(0.2, 0.9)) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) + guides(fill = guide_legend(nrow=2,byrow=TRUE)) 
+p_AUPRC <- ggplot(subset(TinCohortCV_Normal, curve == "AUPRC" & Cohort == "ALL"))
+p_AUPRC <- p_AUPRC + geom_violin(aes(model, value, fill = model), alpha = 0.8, width = 0.5, draw_quantiles = 0.5) + theme_bw() +
+  theme_self() + scale_fill_manual(name = "Models", values = color) + #, labels = c("Baseline   ", "Linear Regression   ", "Logistic Regression   ", "Cox   ", "BAG-CART   ", "Random Forest   ")) + 
+  labs(x = "Models", y = "Area Under PR Curve") + scale_y_continuous(limits = c(0, 0.6)) +
+  guides(fill = guide_legend(nrow=2,byrow=TRUE)) + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+grid_arrange_share_legend(p_AUC, p_AUPRC, nrow = 1, ncol = 2, position = 'bottom')
+
+# C, D
+p_AUC <- ggplot(subset(TinCohortCV_Normal, curve == "AUC" & Cohort != "ALL"))
+p_AUC <- p_AUC + geom_boxplot(aes(Cohort, value, fill = model), alpha = 0.8) + theme_bw() + 
+  theme_self() + scale_fill_manual(name = "Models", values = color) + 
+  labs(x = "Cohorts", y = "Area Under ROC Curve") + scale_y_continuous(limits = c(0.2, 0.9)) +
+  theme(legend.position = "none")
+p_AUPRC <- ggplot(subset(TinCohortCV_Normal, curve == "AUPRC" & Cohort != "ALL"))
+p_AUPRC <- p_AUPRC + geom_boxplot(aes(Cohort, value, fill = model), alpha = 0.8) + theme_bw() +
+  theme_self() + scale_fill_manual(name = "Models", values = color) + 
+  labs(x = "Cohorts", y = "Area Under PR Curve") + scale_y_continuous(limits = c(0, 0.6)) +
+  theme(legend.position = "none")
+grid.arrange(p_AUC, p_AUPRC, ncol = 2)
+```
+
+## Gold standard selection: figure 3
+
+```{r figure3}
+# will also take a long time ... 
+ASCinCohortCV_Normal <- data.frame()
+CELinCohortCV_Normal <- data.frame()
+VENinCohortCV_Normal <- data.frame()
+for (i in 1:10) {
+  ASCinCohortCV_Normal <- rbind(ASCinCohortCV_Normal, kFoldCV_GoldStandard(ASC_Normal, 5, i))
+  CELinCohortCV_Normal <- rbind(CELinCohortCV_Normal, kFoldCV_GoldStandard(CEL_Normal, 5, i))
+  VENinCohortCV_Normal <- rbind(VENinCohortCV_Normal, kFoldCV_GoldStandard(VEN_Normal, 5, i))
+}
+ASCinCohortCV_Normal$Cohort <- "ASC"
+CELinCohortCV_Normal$Cohort <- "CEL"
+VENinCohortCV_Normal$Cohort <- "VEN"
+TinCohortCV_Normal <- rbind(ASCinCohortCV_Normal, CELinCohortCV_Normal, VENinCohortCV_Normal)
+TinCohortCV_Normal$gold_standard <- with(TinCohortCV_Normal, reorder(gold_standard, value))
+
+# A, B
+labels_figure3 <- labels[grep('^ASC', labels$RPT), c("DEATH", "DISCONT", "ENDTRS_C", "ENTRT_PC")]
+labels_figure3$DEATH <- ifelse(labels_figure3$DEATH == 'YES', 'YES', 'NO')
+labels_figure3$risk_level <- sapply(labels_figure3$ENDTRS_C, function(x) {
+  if (x == 'AE') return(1)
+  if (x == 'complete') return(0)
+  if (x == 'possible_AE') return(0.8)
+  if (x == 'progression') return(0.5)
+})
+labels_figure3$ENDTRS_C <- with(labels_figure3, reorder(ENDTRS_C, risk_level))
+colors <- c("#fecc5c", "#fd8d3c", "#e31a1c", "#bd0026")
+p <- ggplot(labels_figure3, aes(x = ENTRT_PC, y = DISCONT))
+p <- p + geom_point(aes(shape = DEATH, color = ENDTRS_C), position = "jitter") + theme_self() + scale_y_discrete(limits = c(0, 1), labels = c("  0", "  1")) + 
+  scale_color_manual(values = colors, name = "Treatment\nStatus") + scale_x_continuous(limits = c(0, 310)) + geom_vline(xintercept = 93, linetype = "dashed") + 
+  scale_shape_manual(values = c(16, 4), name = "Death\nStatus") + geom_text(aes(x = 46, y = 2, label = 'Early\nDiscontinuation')) + 
+  labs(x = 'Treatment Days', y = 'Discontinuation Status')
+
+labels_figure3$DEATH_status <- ifelse(labels_figure3$DEATH == 'YES', 1, 0)
+labels_figure3$Treatment_status <- ifelse(grepl("AE", labels_figure3$ENDTRS_C), 1, 0)
+labels_figure3$new <- ifelse(labels_figure3$DEATH_status + labels_figure3$DISCONT + labels_figure3$Treatment_status, 1, 0)
+p1 <- ggplot(labels_figure3, aes(x = ENTRT_PC, y = new))
+p1 <- p1 + geom_point(aes(shape = DEATH, color = ENDTRS_C), position = "jitter") + theme_self() + scale_y_discrete(limits = c(0, 1), labels = c("  0", "  1")) + 
+  scale_color_manual(values = colors, name = "Treatment\nStatus") + scale_x_continuous(limits = c(0, 310)) + geom_vline(xintercept = 93, linetype = "dashed") + 
+  scale_shape_manual(values = c(16, 4), name = "Death\nStatus") + geom_text(aes(x = 46, y = 2, label = 'Early\nDiscontinuation')) + 
+  labs(x = 'Treatment Days', y = 'New Standard')
+grid_arrange_share_legend(p, p1, nrow = 1, ncol = 2, position = "bottom")
+
+# C, D
+color <- c("White", "#d9f0d3", "#762a83")
+p_AUC <- ggplot(subset(TinCohortCV_Normal, curve == "AUC"))
+p_AUC <- p_AUC + geom_boxplot(aes(Cohort, value, fill = gold_standard), alpha = 0.6) + theme_bw() +
+  theme_self() + scale_fill_manual(name = "Predictor", values = color, labels = c("Baseline", "Discontinuation", "New standard")) + 
+  labs(x = "Cohort", y = "Area Under ROC Curve") + scale_y_continuous(limits = c(0.2, 0.9))
+p_AUPRC <- ggplot(subset(TinCohortCV_Normal, curve == "AUPRC"))
+p_AUPRC <- p_AUPRC + geom_boxplot(aes(Cohort, value, fill = gold_standard), alpha = 0.6) + theme_bw() +
+  theme_self() + scale_fill_manual(name = "Predictor", values = color, labels = c("Baseline", "Discontinuation", "New standard")) + 
+  labs(x = "Cohort", y = "Area Under PR Curve") + scale_y_continuous(limits = c(0, 0.6))
+grid_arrange_share_legend(p_AUC, p_AUPRC, nrow = 1, ncol = 2, position = "bottom")
+```
+
+## Feature importance: figure 4
+```{r figure4}
+# this will take extremely long time ...
+control <- trainControl(method = "repeatedcv", number = 5, repeats = 10)
+model <- train(new_label ~ ., data = coreData_Normal[, c(2, 7:84)], method = "rf", trControl = control, importance = TRUE)
+importance <- varImp(model, scale = F)
+#-----------------------------------------------------#
+# Then we label the features with categories by hand..#
+#-----------------------------------------------------#
+Importance <- read.csv("data/importance.csv")
+colnames(Importance)[1] <- "Features"
+
+model_ASC <- train(new_label ~ ., data = coreData_Normal[grep("^ASC|^CEL", coreData_Normal$RPT), c(2, 7:84)], method = "rf", trControl = control, importance = TRUE)
+model_CEL <- train(new_label ~ ., data = coreData_Normal[grep("^CEL|^VEN", coreData_Normal$RPT), c(2, 7:84)], method = "rf", trControl = control, importance = TRUE)
+model_VEN <- train(new_label ~ ., data = coreData_Normal[grep("^VEN|^ASC", coreData_Normal$RPT), c(2, 7:84)], method = "rf", trControl = control, importance = TRUE)
+
+importance_ASC <- varImp(model_ASC, scale = F)
+importance_CEL <- varImp(model_CEL, scale = F)
+importance_VEN <- varImp(model_VEN, scale = F)
+
+Importance_ASC <- importance_ASC$importance
+Importance_CEL <- importance_CEL$importance
+Importance_VEN <- importance_VEN$importance
+Importance_ASC$Category <- Importance$Category
+Importance_CEL$Category <- Importance$Category
+Importance_VEN$Category <- Importance$Category
+
+# A
+Importance$Features <- with(Importance, reorder(Features, Overall))
+p_Importance <- ggplot(Importance[Importance$Overall > 0, ], aes(x = Features, y = Overall, fill = Category)) + 
+  geom_bar(width = 0.5, stat = "identity") + coord_flip() + theme_self() + 
+  labs(x = "Features", y = "Importance") + 
+  theme(legend.title = element_blank(), legend.position = c(0.68, 0.06),
+        legend.box.background = element_blank(), legend.key.size = unit(0.4, "cm")) + 
+  scale_fill_manual(values = c("#4DBBD5FF", "#E64B35FF", "#00A087FF", "#3C5488FF", "#F39B7FFF"))
+
+# A subplot
+p_Importance_sub <- ggplot(Importance[Importance$Overall > 0, ], aes(x = Category, y = Overall, fill = Category)) + 
+  geom_boxplot(width = 0.5) + coord_flip() + theme_self() + 
+  labs(x = "Categories", y = "Importance") + 
+  theme(axis.text.y = element_blank(), legend.position = "none", axis.ticks.y = element_blank()) + 
+  scale_fill_manual(values=c("#4DBBD5FF", "#E64B35FF", "#00A087FF", "#3C5488FF", "#F39B7FFF"))
+
+# B, C, D
+Importance_ASC$Features <- row.names(Importance_ASC)
+Importance_ASC <- Importance_ASC[order(Importance_ASC$Overall), ]
+Importance_ASC$Features_factor <- factor(Importance_ASC$Features, levels = Importance_ASC$Features, ordered = T)
+Importance_top10_ASC <- Importance_ASC[69:78, ]
+p_Importance_top10_ASC <- ggplot(Importance_top10_ASC, aes(x = Features_factor, y = Overall, fill = Category))
+p_Importance_top10_ASC <- p_Importance_top10_ASC + geom_bar(width = 0.5, stat = "identity") + theme_bw() + 
+  coord_flip() + theme_self() + scale_fill_manual(values = c("#E64B35FF", "#00A087FF")) + 
+  labs(x = "Features", y = "Importance") + theme(legend.position = 'none')
+
+
+Importance_CEL$Features <- row.names(Importance_CEL)
+Importance_CEL <- Importance_CEL[order(Importance_CEL$Overall), ]
+Importance_CEL$Features_factor <- factor(Importance_CEL$Features, levels = Importance_CEL$Features, ordered = T)
+Importance_top10_CEL <- Importance_CEL[69:78, ]
+p_Importance_top10_CEL <- ggplot(Importance_top10_CEL, aes(x = Features_factor, y = Overall, fill = Category))
+p_Importance_top10_CEL <- p_Importance_top10_CEL + geom_bar(width = 0.5, stat = "identity") + theme_bw() + 
+  coord_flip() + theme_self() + scale_fill_manual(values = c("#4DBBD5FF", "#E64B35FF", "#00A087FF", "#F39B7FFF")) + 
+  labs(x = "Features", y = "Importance") + theme(legend.position = 'none')
+
+
+Importance_VEN$Features <- row.names(Importance_VEN)
+Importance_VEN <- Importance_VEN[order(Importance_VEN$Overall), ]
+Importance_VEN$Features_factor <- factor(Importance_VEN$Features, levels = Importance_VEN$Features, ordered = T)
+Importance_top10_VEN <- Importance_VEN[69:78, ]
+p_Importance_top10_VEN <- ggplot(Importance_top10_VEN, aes(x = Features_factor, y = Overall, fill = Category))
+p_Importance_top10_VEN <- p_Importance_top10_VEN + geom_bar(width = 0.5, stat = "identity") + theme_bw() + 
+  coord_flip() + theme_self() + scale_fill_manual(values = c("#E64B35FF", "#00A087FF")) + 
+  labs(x = "Features", y = "Importance") + theme(legend.position = 'none')
+
+grid.arrange(p_Importance_top10_ASC, p_Importance_top10_CEL, p_Importance_top10_VEN, nrow = 3)
+
+```
+
+## Proportion of missing values: figure S1
+
+```{r figureS1}
+core[core == ""] <- NA
+core[core == "."] <- NA
+missing_table <- colMeans(is.na(core[, 12:131]))
+missing_table <- data.frame(feature = names(missing_table), prop = missing_table, stringsAsFactors = F)
+missing_table <- missing_table[order(-missing_table$prop), ]
+missing_table$feature <- factor(missing_table$feature, levels = missing_table$feature, ordered = T)
+ggplot(missing_table, aes(x = feature, y = prop)) + geom_bar(stat = "identity", fill = "#91D1C2FF") + scale_y_continuous(limits = c(0, 1)) + 
+  theme_self() + 
+  labs(x = "Features", y = "Missing proportion") + coord_flip()
+```
+
+## t-SNE: figure S2
+```{r figureS2}
+# The shape of figure will change every time when you run the code 
+# but the pattern of cohort effects will keep the same
+RPT <- unlist(lapply(strsplit(coreData_Normal$RPT, split = "-"), "[", 1))
+RPT <- as.factor(RPT)
+color <- c("#FF410DFF", "#D0DFE6FF", "#95CC5EFF")
+
+names(color) <- unique(RPT)
+tsne <- Rtsne(coreData_Normal[, c(7:84)])
+tsne_frame <- as.data.frame(tsne$Y)
+tsne_frame$cohort <- RPT
+p_tsne <- ggplot(tsne_frame, aes(x = V1, y = V2, color = cohort))
+p_tsne <- p_tsne + geom_point() + theme_bw() + theme(panel.background = element_blank(), panel.grid = element_blank()) + 
+  labs(x = "t-SNE Variable 1", y = "t-SNE Variable 2") + scale_color_manual(values = color, labels = c("ASC", "CEL", "VEN")) + theme_self()
+```

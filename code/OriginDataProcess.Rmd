@@ -1,0 +1,114 @@
+---
+title: "OriginDataProcess"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Extract features in Halabi's paper and process
+
+```{r halabi}
+core <- read.csv("data/CoreTable_training.csv", header = T, stringsAsFactors = F)
+
+# Count the average value of ECOG_C
+# It is used to fill the missing value of this column
+core[, 26] <- as.numeric(core[, 26])
+ECOG_C <- sum(core[, 26], na.rm = T)
+ECOG_C_count <- sum(!is.na(core[, 26]))
+ECOG_C <- ECOG_C/ECOG_C_count
+
+# Calculate the average values of these columns, also for filling the missing value
+core[, 30:50] <- lapply(core[, 30:50], function(x) as.numeric(x))
+ALP <- colSums(core[, 30:50], na.rm = T)
+ALP_count <- unlist(lapply(core[, 30:50], function(x) sum(!is.na(x))))
+ALP_avg <- ALP / ALP_count
+
+# Columns for Halabi
+core_habini <- core[, c(3, 83, 36, 57, 26, 47, 35, 39, 30, 59)]
+core_habini$ANALGESICS <- ifelse(core_habini$ANALGESICS == "YES", 1, 0)
+core_habini$LDH <- vapply(core_habini$LDH, 
+                          function(x) {
+                            if (is.na(x)) {return(1)} # avg for LDH is 263.9051, return 1
+                            ifelse(x > 250, 1, 0)
+                          }, numeric(1))
+
+# for records in core[, c(57, 58, 60, 61, 62, 63, 66, 67, 69, 72, 73, 75)]
+# if BONE is empty & other columns are also empty: 0
+# if BONE have record & other columns are empty: 1
+# if other columns have records: 2
+df_BONE <- core[, c(57, 58, 60, 61, 62, 63, 66, 67, 69, 72, 73, 75)]
+df_BONE[is.na(df_BONE)] <- ""
+BONEvec <- vector("numeric", length = nrow(core_habini))
+for (i in 1:nrow(df_BONE)) {
+  if (df_BONE[i, "BONE"] != "Y" & all(df_BONE[i, -1] != "Y")) BONEvec[i] <- 0
+  if (df_BONE[i, "BONE"] == "Y" & all(df_BONE[i, -1] != "Y")) BONEvec[i] <- 1
+  if (any(df_BONE[i, -1] == "Y")) BONEvec[i] <- 2
+}
+core_habini$BONE <- BONEvec
+
+# Other features
+core_habini$ECOG_C <- ifelse(is.na(core_habini$ECOG_C), ECOG_C, core_habini$ECOG_C)
+core_habini$ALB <- ifelse(is.na(core_habini$ALB), ALP_avg["ALB"], core_habini$ALB)
+core_habini$HB <- ifelse(is.na(core_habini$HB), ALP_avg["HB"], core_habini$HB)
+core_habini$PSA <- ifelse(is.na(core_habini$PSA), log(ALP_avg["PSA"]+1), log(core_habini$PSA+1))
+core_habini$ALP <- ifelse(is.na(core_habini$ALP), log(ALP_avg["ALP"]+1), log(core_habini$ALP+1))
+core_habini$LYMPH_NODES <- ifelse(core_habini$LYMPH_NODES == "Y", 1, 0)
+
+```
+
+## Extract other features based on previous experiment
+
+```{r exclude}
+core <- read.csv("data/CoreTable_training.csv", header = T, stringsAsFactors = F)
+# And load selected features
+selected.features <- readLines("data/selected.features.txt")
+
+core_exclude <- core[, c("RPT", selected.features[c(1, 6:69)])]
+core_exclude$AGEGRP2 <- sapply(core_exclude$AGEGRP2, 
+                               function(x) {
+                                 if (grepl("18-64", x)) return(1)
+                                 if (grepl("65-74", x)) return(2)
+                                 if (grepl(">=75", x)) return(3)
+                               })
+core_exclude$BMI <- as.numeric(core_exclude$BMI)
+BMIavg <- mean(core_exclude$BMI, na.rm = T)
+core_exclude$BMI[is.na(core_exclude$BMI)] <- BMIavg
+core_exclude[, 4:18] <- lapply(core_exclude[, 4:18], 
+                               function(x) {
+                                 x <- as.numeric(x)
+                                 avg <- mean(x, na.rm = T)
+                                 if (avg > 100) {
+                                   ifelse(is.na(x), log(avg+1), log(x+1))
+                                 } else {
+                                   ifelse(is.na(x), avg, x)
+                                 }
+                               })
+core_exclude[, 19:66] <- lapply(core_exclude[, 19:66], 
+                                function(x) {
+                                  ifelse(x == "YES" | x == "Y", 1, 0)
+                                })
+# Give race a dummy code
+race <- table(core$RACE_C)
+race["Other"] <- race["Other"] + race["Hispanic"]
+race_avg <- race/(1600 - 55)
+core_exclude$White <- NA
+core_exclude$Asian <- NA
+core_exclude$Other <- NA
+core_exclude$Black <- NA
+for (i in 1:1600) {
+  if (core[i, "RACE_C"] == "White") 
+    core_exclude[i, c("White", "Asian", "Other", "Black")] <- c(1L, 0L, 0L, 0L)
+  if (core[i, "RACE_C"] == "Asian")
+    core_exclude[i, c("White", "Asian", "Other", "Black")] <- c(0L, 1L, 0L, 0L)
+  if (core[i, "RACE_C"] == "Other")
+    core_exclude[i, c("White", "Asian", "Other", "Black")] <- c(0L, 0L, 1L, 0L)
+  if (core[i, "RACE_C"] == "Black")
+    core_exclude[i, c("White", "Asian", "Other", "Black")] <- c(0L, 0L, 0L, 1L)
+  if (core[i, "RACE_C"] == "Missing" | core[i, "RACE_C"] == "Hispanic")
+    core_exclude[i, c("White", "Asian", "Other", "Black")] <- race_avg[c("White", "Asian", "Other", "Black")]
+}
+```
+
+
