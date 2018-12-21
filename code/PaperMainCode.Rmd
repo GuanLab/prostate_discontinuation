@@ -9,19 +9,24 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ## Load required packages and sources
 
-```{r library}
+```{r library, message=F}
 library(ggplot2)
 library(randomForest)
 library(caret)
 library(Rtsne)
 library(dplyr)
+library(ggsci)
+library(tidyr)
+library(foreach)
+library(doParallel)
 source("grid_arrange_share_legend.R")
 source("kFoldCV_BaseLearner.R")
 source("kFoldCV_GoldStandard.R")
 source("theme_self.R")
+source("modelFit.R")
 ```
 
-## Prepare data for analyzing
+## MAIN: Prepare data for analyzing
 
 ```{r prepare_data}
 labels <- core[, c("RPT", "LKADT_P", "DEATH", "DISCONT", "ENDTRS_C", "ENTRT_PC")]
@@ -30,9 +35,12 @@ labels$ENTRT_PC <- as.integer(labels$ENTRT_PC)
 labels <- na.omit(labels)
 
 # construct new labels
-labels$new_Death <- ifelse(labels$DEATH == 'YES', 1, 0)
+labels$new_Death <- ifelse(labels$DEATH == 'YES' & labels$LKADT_P <= 96, 1, 0)
 labels$new_Discont <- ifelse(grepl("AE", labels$ENDTRS_C) & labels$ENTRT_PC <= 93, 1, 0)
 labels$new_label <- ifelse(labels$new_Death == 0 & labels$new_Discont == 0 & labels$DISCONT == 0, 0, 1)
+
+death <- core[, c("RPT", "DEATH")]
+death$DEATH <- vapply(death$DEATH, function(x) ifelse(x == "YES", 1, 0), numeric(1))
 
 coreData <- cbind(labels[, c("RPT", "new_label")], 
                   DEATH = death[death$RPT %in% labels$RPT, "DEATH"],
@@ -53,7 +61,7 @@ CEL_Normal <- coreData_Normal[grepl("^CEL", coreData_Normal$RPT), ]
 VEN_Normal <- coreData_Normal[grepl("^VEN", coreData_Normal$RPT), ]
 ```
 
-## Summary data: table 1
+## MAIN: Summary data: table 1
 
 ```{r Table1}
 core <- read.csv("data/CoreTable_training.csv", header = T, stringsAsFactors = F)
@@ -79,20 +87,32 @@ summaryCore <- tibble::as.tibble(coreSummary) %>%
             perTrtMissing = sum(ENDTRS_C == 'misce') / n())
 ```
 
-## Base learner selection: figure 2
+## MAIN: Base learner selection: figure 2
 
 ```{r figure2}
 # will take a long time ...
-TotalinCohortCV_Normal <- data.frame()
-ASCinCohortCV_Normal <- data.frame()
-CELinCohortCV_Normal <- data.frame()
-VENinCohortCV_Normal <- data.frame()
-for (i in 1:10) {
-  TotalinCohortCV_Normal <- rbind(TotalinCohortCV_Normal, kFoldCV_BaseLearner(coreData_Normal, 5, i))
-  ASCinCohortCV_Normal <- rbind(ASCinCohortCV_Normal, kFoldCV_BaseLearner(ASC_Normal, 5, i))
-  CELinCohortCV_Normal <- rbind(CELinCohortCV_Normal, kFoldCV_BaseLearner(CEL_Normal, 5, i))
-  VENinCohortCV_Normal <- rbind(VENinCohortCV_Normal, kFoldCV_BaseLearner(VEN_Normal, 5, i))
+cores <- makeCluster(detectCores()-1)
+registerDoParallel(cores)
+
+TotalinCohortCV_Normal <- foreach(i = 1:10, .combine = rbind) %dopar% {
+  temp <- kFoldCV_BaseLearner(coreData_Normal, 5, i)
+  temp
 }
+ASCinCohortCV_Normal <- foreach(i = 1:10, .combine = rbind) %dopar% {
+  temp <- kFoldCV_BaseLearner(ASC_Normal, 5, i)
+  temp
+}
+CELinCohortCV_Normal <- foreach(i = 1:10, .combine = rbind) %dopar% {
+  temp <- kFoldCV_BaseLearner(CEL_Normal, 5, i)
+  temp
+}
+VENinCohortCV_Normal <- foreach(i = 1:10, .combine = rbind) %dopar% {
+  temp <- kFoldCV_BaseLearner(VEN_Normal, 5, i)
+  temp
+}
+
+stopCluster(cores)
+
 TotalinCohortCV_Normal$Cohort <- 'ALL'
 ASCinCohortCV_Normal$Cohort <- "ASC"
 CELinCohortCV_Normal$Cohort <- "CEL"
@@ -101,6 +121,7 @@ TinCohortCV_Normal <- rbind(TotalinCohortCV_Normal, ASCinCohortCV_Normal, CELinC
 TinCohortCV_Normal$model <- reorder(TinCohortCV_Normal$model, TinCohortCV_Normal$value)
 
 # A, B
+color <- c("White", "#D0DFE6FF", "#95CC5EFF", "#F7C530FF", "#6EE2FFFF", "#FF410DFF")
 p_AUC <- ggplot(subset(TinCohortCV_Normal, curve == "AUC" & Cohort == "ALL"))
 p_AUC <- p_AUC + geom_violin(aes(model, value, fill = model), alpha = 0.8, width = 0.5, draw_quantiles = 0.5) + theme_bw() + 
   theme_self() + scale_fill_manual(name = "Models", values = color) + #, labels = c("Baseline   ", "Linear Regression   ", "Logistic Regression   ", "Cox   ", "BAG-CART   ", "Random Forest   ")) + 
@@ -127,26 +148,99 @@ p_AUPRC <- p_AUPRC + geom_boxplot(aes(Cohort, value, fill = model), alpha = 0.8)
 grid.arrange(p_AUC, p_AUPRC, ncol = 2)
 ```
 
-## Gold standard selection: figure 3
+## REVISION: Use some of the responsers as predictors
+
+```{r responser_to_predictor}
+
+coreData_addPred <- cbind(labels[, c("RPT", "new_label")], 
+                  DEATH = death[death$RPT %in% labels$RPT, "DEATH"],
+                  DEATH_day = core[core$RPT %in% labels$RPT, "LKADT_P"],
+                  DISCONT = core[core$RPT %in% labels$RPT, "DISCONT"],
+                  DISCONT_day = core[core$RPT %in% labels$RPT, "ENTRT_PC"],
+                  Treatment = core[core$RPT %in% labels$RPT, "ENDTRS_C"],
+                  core_habini[core_habini$RPT %in% labels$RPT, -1],
+                  core_exclude[core_exclude$RPT %in% labels$RPT, -1])
+coreData_addPred[, c(8:85)] <- lapply(coreData_addPred[, c(8:85)], 
+                                      function(x) (x-min(x))/(max(x)-min(x)))
+
+
+cores <- makeCluster(detectCores()-1)
+registerDoParallel(cores)
+
+TotalinCohortCV_Normal <- foreach(i = 1:10, .combine = rbind) %dopar% {
+  set.seed(i)
+  coreData_addPred <- coreData_addPred[sample(nrow(coreData_addPred)), ]
+  folds <- cut(seq(1, nrow(coreData_addPred)), breaks = 5, labels = F)
+  results <- data.frame()
+  for (k in 1:5) {
+    testIndexes <- which(folds == k, arr.ind = T)
+    test <- coreData_addPred[testIndexes, ]
+    train <- coreData_addPred[-testIndexes, ]
+    train$DISCONT <- as.numeric(as.character(train$DISCONT))
+    train$DISCONT_day <- as.numeric(as.character(train$DISCONT_day))
+    train <- na.omit(train)
+    test$DISCONT <- as.numeric(as.character(test$DISCONT))
+    test$DISCONT_day <- as.numeric(as.character(test$DISCONT_day))
+    test <- na.omit(test)
+    
+    train_discont <- train[, c(5, 8:85)]
+    test_discont <- test[, c(5, 8:85)]
+    rf_model_DISCONT <- modelFit(DISCONT ~ ., train_discont, test_discont, model = "rf", seed = 1234, target_column = "DISCONT")
+    
+    train_asResponser <- train[, c(5, 3:4, 6:85)]
+    test_asResponser <- test[, c(5, 3:4, 6:85)]
+    rf_model_DISCONT_Responsers <- modelFit(DISCONT ~ ., train_asResponser, test_asResponser, model = "rf", seed = 1234, target_column = "DISCONT")
+    rf_model_NEW <- modelFit(new_label ~ ., train[, c(2, 8:85)], test[, c(5, 8:85)], model = "rf", seed = 1234, target_column = "DISCONT")
+    res <- data.frame(identity = rep(c("78 Feature", "78 Feature + Responsers", "78 Feature (NEW)"), each = 2),
+                      value = c(rf_model_DISCONT$roc$auc, rf_model_DISCONT$pr$auc.integral,
+                                rf_model_DISCONT_Responsers$roc$auc, rf_model_DISCONT_Responsers$pr$auc.integral, 
+                                rf_model_NEW$roc$auc, rf_model_NEW$pr$auc.integral),
+                      stringsAsFactors = F)
+    res$curve <- rep(c("AUC", "AUPRC"), 3)
+    results <- rbind(results, res)
+  }
+  results
+}
+
+stopCluster(cores)
+```
+
+## MAIN: Gold standard selection: figure 3
 
 ```{r figure3}
+# Use parallel computing to accelerate the processing
+cores <- makeCluster(detectCores()-1)
+registerDoParallel(cores)
+
 # will also take a long time ... 
-ASCinCohortCV_Normal <- data.frame()
-CELinCohortCV_Normal <- data.frame()
-VENinCohortCV_Normal <- data.frame()
-for (i in 1:10) {
-  ASCinCohortCV_Normal <- rbind(ASCinCohortCV_Normal, kFoldCV_GoldStandard(ASC_Normal, 5, i))
-  CELinCohortCV_Normal <- rbind(CELinCohortCV_Normal, kFoldCV_GoldStandard(CEL_Normal, 5, i))
-  VENinCohortCV_Normal <- rbind(VENinCohortCV_Normal, kFoldCV_GoldStandard(VEN_Normal, 5, i))
+TotalinCohortCV_Normal <- foreach(i = 1:10, .combine = rbind) %dopar% {
+  temp <- kFoldCV_GoldStandard(coreData_Normal, 5, i)
+  temp
 }
+ASCinCohortCV_Normal <- foreach(i = 1:10, .combine = rbind) %dopar% {
+  temp <- kFoldCV_GoldStandard(ASC_Normal, 5, i)
+  temp
+}
+CELinCohortCV_Normal <- foreach(i = 1:10, .combine = rbind) %dopar% {
+  temp <- kFoldCV_GoldStandard(CEL_Normal, 5, i)
+  temp
+}
+VENinCohortCV_Normal <- foreach(i = 1:10, .combine = rbind) %dopar% {
+  temp <- kFoldCV_GoldStandard(VEN, 5, i)
+  temp
+}
+
+stopCluster(cores)
+
+TotalinCohortCV_Normal$Cohort <- "ALL"
 ASCinCohortCV_Normal$Cohort <- "ASC"
 CELinCohortCV_Normal$Cohort <- "CEL"
 VENinCohortCV_Normal$Cohort <- "VEN"
-TinCohortCV_Normal <- rbind(ASCinCohortCV_Normal, CELinCohortCV_Normal, VENinCohortCV_Normal)
+TinCohortCV_Normal <- rbind(TotalinCohortCV_Normal, ASCinCohortCV_Normal, CELinCohortCV_Normal, VENinCohortCV_Normal)
 TinCohortCV_Normal$gold_standard <- with(TinCohortCV_Normal, reorder(gold_standard, value))
 
 # A, B
-labels_figure3 <- labels[grep('^ASC', labels$RPT), c("DEATH", "DISCONT", "ENDTRS_C", "ENTRT_PC")]
+labels_figure3 <- labels[, c("DEATH", "DISCONT", "ENDTRS_C", "ENTRT_PC", "LKADT_P")]
 labels_figure3$DEATH <- ifelse(labels_figure3$DEATH == 'YES', 'YES', 'NO')
 labels_figure3$risk_level <- sapply(labels_figure3$ENDTRS_C, function(x) {
   if (x == 'AE') return(1)
@@ -162,7 +256,7 @@ p <- p + geom_point(aes(shape = DEATH, color = ENDTRS_C), position = "jitter") +
   scale_shape_manual(values = c(16, 4), name = "Death\nStatus") + geom_text(aes(x = 46, y = 2, label = 'Early\nDiscontinuation')) + 
   labs(x = 'Treatment Days', y = 'Discontinuation Status')
 
-labels_figure3$DEATH_status <- ifelse(labels_figure3$DEATH == 'YES', 1, 0)
+labels_figure3$DEATH_status <- ifelse(labels_figure3$DEATH == 'YES' & labels$LKADT_P <= 96, 1, 0)
 labels_figure3$Treatment_status <- ifelse(grepl("AE", labels_figure3$ENDTRS_C), 1, 0)
 labels_figure3$new <- ifelse(labels_figure3$DEATH_status + labels_figure3$DISCONT + labels_figure3$Treatment_status, 1, 0)
 p1 <- ggplot(labels_figure3, aes(x = ENTRT_PC, y = new))
@@ -170,23 +264,62 @@ p1 <- p1 + geom_point(aes(shape = DEATH, color = ENDTRS_C), position = "jitter")
   scale_color_manual(values = colors, name = "Treatment\nStatus") + scale_x_continuous(limits = c(0, 310)) + geom_vline(xintercept = 93, linetype = "dashed") + 
   scale_shape_manual(values = c(16, 4), name = "Death\nStatus") + geom_text(aes(x = 46, y = 2, label = 'Early\nDiscontinuation')) + 
   labs(x = 'Treatment Days', y = 'New Standard')
-grid_arrange_share_legend(p, p1, nrow = 1, ncol = 2, position = "bottom")
+
+grid_arrange_share_legend(p, p1, nrow = 1, ncol = 2, position = "bottom") # 9 x 3
 
 # C, D
-color <- c("White", "#d9f0d3", "#762a83")
+color <- c("White", "#D0DFE6FF", "#FF410DFF")
 p_AUC <- ggplot(subset(TinCohortCV_Normal, curve == "AUC"))
-p_AUC <- p_AUC + geom_boxplot(aes(Cohort, value, fill = gold_standard), alpha = 0.6) + theme_bw() +
-  theme_self() + scale_fill_manual(name = "Predictor", values = color, labels = c("Baseline", "Discontinuation", "New standard")) + 
+p_AUC <- p_AUC + geom_boxplot(aes(Cohort, value, fill = gold_standard)) + theme_bw() +
+  theme_self() + scale_fill_manual(name = "Predictor", values = color, labels = c("Baseline", "Discontinuation", "New standard")) + scale_x_discrete(labels = c("Full Dataset", "ASC", "CEL", "VEN")) +
   labs(x = "Cohort", y = "Area Under ROC Curve") + scale_y_continuous(limits = c(0.2, 0.9))
 p_AUPRC <- ggplot(subset(TinCohortCV_Normal, curve == "AUPRC"))
-p_AUPRC <- p_AUPRC + geom_boxplot(aes(Cohort, value, fill = gold_standard), alpha = 0.6) + theme_bw() +
-  theme_self() + scale_fill_manual(name = "Predictor", values = color, labels = c("Baseline", "Discontinuation", "New standard")) + 
+p_AUPRC <- p_AUPRC + geom_boxplot(aes(Cohort, value, fill = gold_standard)) + theme_bw() +
+  theme_self() + scale_fill_manual(name = "Predictor", values = color, labels = c("Baseline", "Discontinuation", "New standard")) + scale_x_discrete(labels = c("Full Dataset", "ASC", "CEL", "VEN")) + 
   labs(x = "Cohort", y = "Area Under PR Curve") + scale_y_continuous(limits = c(0, 0.6))
 grid_arrange_share_legend(p_AUC, p_AUPRC, nrow = 1, ncol = 2, position = "bottom")
 ```
 
-## Feature importance: figure 4
+## REVISION: Gold standard selection: test
+
+```{r gs_test}
+cores <- makeCluster(detectCores()-1)
+registerDoParallel(cores)
+
+TotalinCohortCV_Normal_GS <- foreach(i = 1:60, .combine = rbind) %dopar% {
+  temp <- kFoldCV_GoldStandard(coreData_Normal, 5, i)
+  temp
+}
+ASCinCohortCV_Normal_GS <- foreach(i = 1:60, .combine = rbind) %dopar% {
+  temp <- kFoldCV_GoldStandard(ASC_Normal, 5, i)
+  temp
+}
+CELinCohortCV_Normal_GS <- foreach(i = 1:60, .combine = rbind) %dopar% {
+  temp <- kFoldCV_GoldStandard(CEL_Normal, 5, i)
+  temp
+}
+VENinCohortCV_Normal_GS <- foreach(i = 1:60, .combine = rbind) %dopar% {
+  temp <- kFoldCV_GoldStandard(VEN_Normal, 5, i)
+  temp
+}
+
+stopCluster(cores)
+
+discont_score <- subset(VENinCohortCV_Normal_GS, gold_standard == "discont" & curve == "AUC")
+new_score <- subset(VENinCohortCV_Normal_GS, gold_standard == "new" & curve == "AUC")
+wilcox.test(discont_score$value, new_score$value)
+
+discont_score <- subset(VENinCohortCV_Normal_GS, gold_standard == "discont" & curve == "AUPRC")
+new_score <- subset(VENinCohortCV_Normal_GS, gold_standard == "new" & curve == "AUPRC")
+wilcox.test(discont_score$value, new_score$value)
+```
+
+## MAIN: Feature importance: figure 4
+
 ```{r figure4}
+cores <- makeCluster(detectCores()-1)
+registerDoParallel(cores)
+
 # this will take extremely long time ...
 control <- trainControl(method = "repeatedcv", number = 5, repeats = 10)
 model <- train(new_label ~ ., data = coreData_Normal[, c(2, 7:84)], method = "rf", trControl = control, importance = TRUE)
@@ -200,6 +333,8 @@ colnames(Importance)[1] <- "Features"
 model_ASC <- train(new_label ~ ., data = coreData_Normal[grep("^ASC|^CEL", coreData_Normal$RPT), c(2, 7:84)], method = "rf", trControl = control, importance = TRUE)
 model_CEL <- train(new_label ~ ., data = coreData_Normal[grep("^CEL|^VEN", coreData_Normal$RPT), c(2, 7:84)], method = "rf", trControl = control, importance = TRUE)
 model_VEN <- train(new_label ~ ., data = coreData_Normal[grep("^VEN|^ASC", coreData_Normal$RPT), c(2, 7:84)], method = "rf", trControl = control, importance = TRUE)
+
+stopCluster(cores)
 
 importance_ASC <- varImp(model_ASC, scale = F)
 importance_CEL <- varImp(model_CEL, scale = F)
@@ -232,7 +367,7 @@ p_Importance_sub <- ggplot(Importance[Importance$Overall > 0, ], aes(x = Categor
 Importance_ASC$Features <- row.names(Importance_ASC)
 Importance_ASC <- Importance_ASC[order(Importance_ASC$Overall), ]
 Importance_ASC$Features_factor <- factor(Importance_ASC$Features, levels = Importance_ASC$Features, ordered = T)
-Importance_top10_ASC <- Importance_ASC[69:78, ]
+Importance_top10_ASC <- Importance_ASC # [69:78, ]
 p_Importance_top10_ASC <- ggplot(Importance_top10_ASC, aes(x = Features_factor, y = Overall, fill = Category))
 p_Importance_top10_ASC <- p_Importance_top10_ASC + geom_bar(width = 0.5, stat = "identity") + theme_bw() + 
   coord_flip() + theme_self() + scale_fill_manual(values = c("#E64B35FF", "#00A087FF")) + 
@@ -262,7 +397,160 @@ grid.arrange(p_Importance_top10_ASC, p_Importance_top10_CEL, p_Importance_top10_
 
 ```
 
-## Proportion of missing values: figure S1
+## REVISION: Features vs. treatment status 
+
+```{r featurevstreament}
+top_10_feature <- Importance[order(-Importance$Overall), ]
+top_10_feature <- as.character(top_10_feature[1:10, "Features"])
+coreData_Normal_Feature <- coreData_Normal
+coreData_Normal_Feature$ENDTRS_C <- core[core$RPT %in% coreData_Normal_Feature$RPT, "ENDTRS_C"]
+coreData_Normal_Feature <- coreData_Normal_Feature[, c("new_label", "DISCONT", "ENDTRS_C", top_10_feature)]
+coreData_Normal_Feature$new_label <- as.factor(coreData_Normal_Feature$new_label)
+coreData_Normal_Feature$ENDTRS_C_NUM <- unlist(lapply(coreData_Normal_Feature$ENDTRS_C, function(x) {
+  if (x == "AE") return(3)
+  if (x == "possible_AE") return(2)
+  if (x == "progression") return(1)
+  if (x == "complete") return(0)
+}))
+coreData_Normal_Feature$new_label <- as.numeric(as.character(coreData_Normal_Feature$new_label))
+coreData_Normal_Feature$DISCONT <- as.numeric(as.character(coreData_Normal_Feature$DISCONT))
+
+set.seed(1)
+data <- coreData_Normal_Feature
+data <- data[sample(nrow(data)), ]
+folds <- cut(seq(1, nrow(data)), breaks = 5, labels = F)
+cor.df <- as.data.frame(matrix(nrow = 11, ncol = 5))
+corSig.df <- as.data.frame(matrix(nrow = 11, ncol = 5))
+tests <- data.frame()
+for (i in 1:5) {
+  testIndexes <- which(folds == i, arr.ind = T)
+  test <- data[testIndexes, ]
+  train <- data[-testIndexes, ]
+  rf.model <- randomForest(new_label ~ ., data = select(train, c(new_label, ALB:MHSOCIAL)))
+  pred <- predict(rf.model, select(test, ALB:MHSOCIAL))
+  test$rf.model <- pred
+  tests <- rbind(tests, test)
+}
+cors <- lapply(select(tests, ALB:MHSOCIAL, rf.model), cor.test, tests$DISCONT)
+cors.estimate <- lapply(cors, `[[`, 'estimate')
+cors.significant <- lapply(cors, `[[`, 'p.value')
+
+summary(lm(DISCONT ~ ALB, data = tests))
+summary(lm(DISCONT ~ rf.model, data = tests))
+
+tree <- getTree(rf.model, k = 500, labelVar = T) %>% rownames_to_column() %>% 
+  mutate(`split point` = ifelse(!is.na(`split var`), `split point`, NA))
+graph_frame <- data.frame(from = rep(tree$rowname, 2),
+                          to = c(tree$`left daughter`, tree$`right daughter`))
+graph <- graph_from_data_frame(graph_frame) %>% delete_vertices("0")
+V(graph)$node_label <- as.character(tree$`split var`)
+V(graph)$leaf_label <- as.character(round(tree$prediction, 2))
+V(graph)$split <- as.character(round(tree$`split point`, digits = 2))
+plot <- ggraph(graph, 'dendrogram') + 
+    theme_bw() +
+    geom_edge_link() +
+    geom_node_point() +
+    geom_node_text(aes(label = node_label), na.rm = TRUE, repel = TRUE)
+#     geom_node_label(aes(label = split), vjust = 2.5, na.rm = TRUE, fill = "white") + 
+#     geom_node_label(aes(label = leaf_label, fill = leaf_label), na.rm = TRUE,
+# 					repel = TRUE, colour = "white", fontface = "bold", show.legend = FALSE)
+```
+
+## MAIN: Final score in DREAM challenge: figure 5
+
+```{r figure5}
+res <- read.table("data/q2_results.txt", sep = "\t", header = T, skip = 6, stringsAsFactors = F)
+res$team[which(res$team == 'Y G')] <- 'Yuanfang Guan'
+res_max <- as_tibble(res) %>%
+  group_by(team) %>% filter(AUPRC == max(AUPRC))
+
+res_max <- res_max[!duplicated(res_max$team), ]
+res_max <- res_max[order(res_max$AUPRC), ]
+res_max$team <- factor(res_max$team, levels = res_max$team)
+
+
+methods <- as.data.frame(matrix(ncol = 21, nrow = 34))
+row.names(methods) <- res_max$team
+colnames(methods) <- c("DEATH", "LKADT_P", "DISCONT", "ENDTRS_C", "ENDTRT_PC", "Reconstruction", "Cox", "Random Forest", "Gradient Boosting",
+                       "Binomial Regression", "Cluster", "SVM", "Linear Regression", "Neural Network", "Generalized Regression Model",
+                       "Elastic Net", "LASSO", "Random Survival Forest", "Logistic Regression", "Ensembl", "Use New Label")
+
+# just type by hand ...  
+methods[1, ]  <- c(0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[2, ]  <- 2
+methods[3, ]  <- 2
+methods[4, ]  <- c(0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[5, ]  <- c(2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[6, ]  <- 2
+methods[7, ]  <- c(0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0)
+methods[8, ]  <- c(0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[9, ]  <- c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0)
+methods[10, ] <- c(0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[11, ] <- c(0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[12, ] <- c(0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 1, 0)
+methods[13, ] <- 2
+methods[14, ] <- c(0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0)
+methods[15, ] <- c(1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0)
+methods[16, ] <- c(0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0)
+methods[17, ] <- c(0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0)
+methods[18, ] <- c(0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[19, ] <- 2
+methods[20, ] <- c(0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)
+methods[21, ] <- c(0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0)
+methods[22, ] <- c(0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0)
+methods[23, ] <- c(0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1)
+methods[24, ] <- c(0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[25, ] <- c(0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0)
+methods[26, ] <- c(0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[27, ] <- 2
+methods[28, ] <- c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0)
+methods[29, ] <- c(0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0)
+methods[30, ] <- c(0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[31, ] <- c(0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0)
+methods[32, ] <- c(0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[33, ] <- c(0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+methods[34, ] <- c(1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)
+
+methods <- as_tibble(methods)
+res_all <- bind_cols(res_max, methods)
+res_all <- gather(res_all, Class, labels, DEATH:`Use New Label`) %>%
+  mutate(Group = ifelse(Class %in% c("DEATH", "LKADT_P", "DISCONT", "ENDTRS_C", "ENDTRT_PC", "Reconstruction"), "Gold Standard\nConstruction", "Model/Strategy"))
+res_all$labels <- as.factor(res_all$labels)
+res_all$Group <- as.factor(res_all$Group)
+
+# A
+p0 <- ggplot(res_all)
+p0 <- p0 + geom_tile(aes(x = team, y = Class, fill = labels), color = "black") + coord_flip() + theme_self() +
+  theme(legend.position = "none", axis.ticks = element_blank(), axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5), axis.title.x = element_blank(), axis.line = element_blank(), panel.border = element_blank()) + scale_fill_manual(values = c("White", "#0073C2FF", "#868686FF")) + facet_grid(~Group, space="free", scale="free") + labs(x = 'Teams')
+p0
+
+p <- ggplot(res_max)
+p <- p + geom_bar(aes(x = team, y = AUPRC), stat = "identity", fill = "#DF8F44FF") + geom_hline(yintercept = 0.104, linetype = "dashed") +
+  coord_flip() + theme_self() + scale_fill_aaas() + 
+  theme(legend.position = c(0.8, 0.05), legend.title = element_blank(), panel.border = element_blank(), 
+        axis.text.y = element_blank(), axis.ticks = element_blank(), axis.line.x = element_line(size = 0.5)) + 
+  geom_text(aes(x = team, y = AUPRC, label = round(AUPRC, 4)), hjust = 1, nudge_x = 0.05, color = 'black') + 
+  labs(x = '', y = 'Area Under PR Curve')
+p
+
+# B
+p1 <- ggplot(res_max[27:34, ]) + 
+  geom_bar(aes(x = team, y = p.val_random), fill = '#79AF97FF', size = 3, stat = "identity") + 
+  theme_self() + coord_flip() + 
+  labs(x = '', y = 'p-Value') + 
+  geom_text(aes(x = team, y = p.val_random, label = round(p.val_random, 3)), hjust = 1)
+p1
+
+# C
+p2 <- ggplot(res_max[27:34, ]) + 
+  geom_bar(aes(x = team, y = Bayes_factor), fill = '#00A1D5FF', size = 3, stat = "identity") + 
+  theme_self() + coord_flip() + 
+  geom_text(aes(x = team, y = Bayes_factor, label = round(Bayes_factor, 2)), hjust = 1) + 
+  labs(x = '', y = 'Bayes Factor')
+p2
+```
+
+## MAIN: Proportion of missing values: figure S1
 
 ```{r figureS1}
 core[core == ""] <- NA
@@ -276,7 +564,8 @@ ggplot(missing_table, aes(x = feature, y = prop)) + geom_bar(stat = "identity", 
   labs(x = "Features", y = "Missing proportion") + coord_flip()
 ```
 
-## t-SNE: figure S2
+## MAIN: t-SNE: figure S2
+
 ```{r figureS2}
 # The shape of figure will change every time when you run the code 
 # but the pattern of cohort effects will keep the same
