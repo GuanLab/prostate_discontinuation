@@ -1,4 +1,4 @@
-function(formula, train.data, test.data, model = c("bag", "cox", "lm", "logit", "rf"), 
+modelFit <- function(formula, train.data, test.data, model = c("bag", "cox", "lm", "logit", "rf"), 
          seed, target_column) {
   
   require(ipred)
