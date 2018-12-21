@@ -11,7 +11,7 @@ Please contact (gyuanfan@umich.edu or dengkw@umich.edu) if you have any question
 </p>
 
 ## Data Summary
-Data were collected from the provider-deidentified comparator arm datasets of phase III prostate cancer clinical trial, including ASCENT2 (ASC) from Memorial Sloan Kettering Cancer Center, with 105 patients discontinuing docetaxel due to adverse event or possible adverse event 35, CELGENE (CEL) from Celgene, with 41 discontinued patients 36, and EFC6546 (VEN) from Sanofi, with 51 discontinuations.  
+The raw data were collected from the provider-deidentified comparator arm datasets of phase III prostate cancer clinical trial, including ASCENT2 (ASC) from Memorial Sloan Kettering Cancer Center, with 105 patients discontinuing docetaxel due to adverse event or possible adverse event 35, CELGENE (CEL) from Celgene, with 41 discontinued patients 36, and EFC6546 (VEN) from Sanofi, with 51 discontinuations. The raw data won't include in this repository because of privacy consideration. We only upload the features we selected and their importance maps in the `data` directory.
 
 **Basic Information**
 
