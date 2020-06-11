@@ -6,6 +6,10 @@ Background & source data: [DREAM9.5 - Prostate Cancer DREAM Challenge](https://w
 Solution see also: [Yuanfang Guan's winning solution](https://www.synapse.org/#!Synapse:syn7152438/wiki/403154)  
 
 Please contact (gyuanfan@umich.edu or dengkw@umich.edu) if you have any questions or suggestions.
+
+This paper is published in iScience 
+Deng K, Li H, Guan Y.  2020.  Treatment Stratification of Patients with Metastatic Castration-resistant Prostate Cancer by Machine Learning. iScience. 2020 Feb 21;23(2):100804. doi: 10.1016/j.isci.2019.100804. Epub 2019 Dec 26.
+
 <p align="left">
   <img src="https://github.com/nonztalk/prostate_discontinuation/blob/master/img/Workflow.png" width="700">
 </p>
